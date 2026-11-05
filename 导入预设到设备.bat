@@ -5,6 +5,7 @@ cd /d "%~dp0"
 
 set "PKG=com.llsl.viper4android"
 set "DBPATH=/data/data/%PKG%/databases/viper4android.db"
+set "EXTDIR=/sdcard/Android/data/%PKG%/files"
 
 echo ============================================
 echo   V4A 预设批量导入
@@ -44,19 +45,31 @@ echo [*] 设备: %DEV%
 
 set "UID0=1"
 for /f "delims=" %%u in ('%ADB% shell id -u 2^>nul') do set "UID0=%%u"
-set "SH=%ADB% shell"
+set "ORIG_UID=%UID0%"
 if not "%UID0%"=="0" (
-    set "SH=%ADB% shell su -c"
-    echo [*] adb shell 非 root，改用 su -c 执行
+    echo [*] adb shell 非 root，尝试 adb root ...
+    %ADB% root >nul 2>nul
+    ping -n 4 127.0.0.1 >nul
+    set "UID0=1"
+    for /f "delims=" %%u in ('%ADB% shell id -u 2^>nul') do set "UID0=%%u"
+)
+if not "%ORIG_UID%"=="0" if "%UID0%"=="0" set "ROOTED=1"
+set Q="
+set "SUP=%ADB% shell %Q%"
+set "SUQ=%Q%"
+if not "%UID0%"=="0" (
+    set "SUP=%ADB% shell %Q%su -c '"
+    set "SUQ='%Q%"
+    echo [*] 仍非 root，改用 su -c 执行
 )
 
-%SH% "pm path %PKG%" 2>nul | findstr /c:"package:" >nul
+%SUP%pm path %PKG%%SUQ% 2>nul | findstr /c:"package:" >nul
 if errorlevel 1 (
     echo [x] 设备上未安装 %PKG%
     goto :fail
 )
 
-%SH% "test -f %DBPATH% && echo DB_OK" 2>nul | findstr "DB_OK" >nul
+%SUP%test -f %DBPATH% && echo DB_OK%SUQ% 2>nul | findstr "DB_OK" >nul
 if errorlevel 1 (
     echo [x] 找不到数据库 %DBPATH%，请先启动一次 V4A。
     goto :fail
@@ -78,9 +91,8 @@ set "WORK=%TEMP%\v4a_import_%RANDOM%%RANDOM%"
 mkdir "%WORK%" 2>nul
 
 echo.
-echo [1/5] 停止应用并导出数据库...
-%SH% "am force-stop %PKG%" >nul 2>nul
-%SH% "rm -rf /data/local/tmp/v4a_work; mkdir -p /data/local/tmp/v4a_work; cp -f %DBPATH% /data/local/tmp/v4a_work/db; [ -f %DBPATH%-wal ] && cp -f %DBPATH%-wal /data/local/tmp/v4a_work/db-wal; [ -f %DBPATH%-shm ] && cp -f %DBPATH%-shm /data/local/tmp/v4a_work/db-shm; echo EXPORTED" | findstr "EXPORTED" >nul
+echo [1/6] 停止应用并导出数据库...
+%SUP%am force-stop %PKG%; rm -rf /data/local/tmp/v4a_work; mkdir -p /data/local/tmp/v4a_work; cp -f %DBPATH% /data/local/tmp/v4a_work/db; [ -f %DBPATH%-wal ] && cp -f %DBPATH%-wal /data/local/tmp/v4a_work/db-wal; [ -f %DBPATH%-shm ] && cp -f %DBPATH%-shm /data/local/tmp/v4a_work/db-shm; ls -lZ %DBPATH% > /data/local/tmp/v4a_work/ctx; chmod 644 /data/local/tmp/v4a_work/db /data/local/tmp/v4a_work/db-wal /data/local/tmp/v4a_work/db-shm /data/local/tmp/v4a_work/ctx 2>/dev/null; echo EXPORTED%SUQ% | findstr "EXPORTED" >nul
 if errorlevel 1 (
     echo [x] 导出数据库失败。
     goto :fail_clean
@@ -92,38 +104,67 @@ if errorlevel 1 (
 )
 %ADB% pull /data/local/tmp/v4a_work/db-wal "%WORK%\viper4android.db-wal" >nul 2>nul
 %ADB% pull /data/local/tmp/v4a_work/db-shm "%WORK%\viper4android.db-shm" >nul 2>nul
+%ADB% pull /data/local/tmp/v4a_work/ctx "%WORK%\ctx.txt" >nul 2>nul
 
-echo [2/5] 写入预设...
+set "DBCTX="
+for /f "usebackq tokens=3,4,5" %%a in ("%WORK%\ctx.txt") do (
+    set "DBNOW=%%a:%%b"
+    set "DBCTX=%%c"
+)
+if "%DBCTX%"=="?" set "DBCTX="
+
+echo [2/6] 写入预设...
 %PY% -c "import sys,io;p=sys.argv[1];s=io.open(p,encoding='utf-8').read();exec(compile(s.split('#@@PY'+'@@')[1],p,'exec'))" "%~f0" "%WORK%\viper4android.db" "%CD%"
 if errorlevel 4 (
-    echo [3/5] 没有需要变更的预设，跳过回推。
-    goto :verify
+    echo [3/6] 没有需要变更的预设，跳过回推。
+    goto :ddc
 )
 if errorlevel 1 (
     echo [x] 写入数据库失败。
     goto :fail_clean
 )
 
-echo [3/5] 回推数据库...
-%ADB% push "%WORK%\viper4android.db" /data/local/tmp/v4a_work/db_new >nul
+echo [3/6] 回推数据库...
+%ADB% push "%WORK%\viper4android.db" /data/local/tmp/v4a_new.db >nul
 if errorlevel 1 (
     echo [x] 推送数据库失败。
     goto :fail_clean
 )
-set "APPLY=CTX=$(stat -c %%C %DBPATH%); OWN=$(stat -c %%u:%%g %DBPATH%); rm -f %DBPATH%-wal %DBPATH%-shm; cp -f /data/local/tmp/v4a_work/db_new %DBPATH%; chown $OWN %DBPATH%; chmod 660 %DBPATH%; chcon $CTX %DBPATH%; echo APPLIED $OWN $CTX"
-%SH% "%APPLY%" | findstr "APPLIED" >nul
+set "CHCON="
+if defined DBCTX set "CHCON=chcon %DBCTX% $DB;"
+%SUP%DB=%DBPATH%; OWN=$(stat -c %%u:%%g $DB); rm -f $DB-wal $DB-shm; cp -f /data/local/tmp/v4a_new.db $DB; chown $OWN $DB; chmod 660 $DB; %CHCON% echo APPLIED $OWN%SUQ% | findstr "APPLIED" >nul
 if errorlevel 1 (
     echo [x] 替换数据库失败。
     goto :fail_clean
 )
 
-:verify
-echo [4/5] 校验...
+:ddc
+set "DDCN=0"
+for %%f in ("%CD%\DDC\*.vdc") do set /a DDCN+=1
+if %DDCN% GTR 0 (
+    echo [4/6] 同步 DDC 耳机补偿文件 %DDCN% 个...
+    %ADB% shell "rm -rf /data/local/tmp/v4a_ddc; mkdir -p /data/local/tmp/v4a_ddc" >nul 2>nul
+    for %%f in ("%CD%\DDC\*.vdc") do %ADB% push "%%f" /data/local/tmp/v4a_ddc/ >nul 2>nul
+    %SUP%D=%EXTDIR%/DDC; mkdir -p $D 2>/dev/null; if [ ! -d $D ]; then D=/data/media/0/Android/data/%PKG%/files/DDC; mkdir -p $D; fi; cp -f /data/local/tmp/v4a_ddc/*.vdc $D/; U=$(stat -c %%u %DBPATH%); G=$(stat -c %%g /data/media/0/Android/data 2>/dev/null); [ -n "$G" ] || G=$(stat -c %%g %DBPATH%); chown -R $U:$G $D; chmod 770 $D; chmod 660 $D/*.vdc; echo DDC_SYNCED $(ls $D/*.vdc 2>/dev/null | wc -l) $D%SUQ%
+) else (
+    echo [4/6] 无需同步 DDC
+)
+
+echo [5/6] 校验...
 set "DBCOUNT=?"
-for /f "delims=" %%c in ('%SH% "/system/bin/sqlite3 %DBPATH% 'select count(*) from presets;'" 2^>nul') do set "DBCOUNT=%%c"
-echo [5/5] 清理临时文件...
-%SH% "rm -rf /data/local/tmp/v4a_work" >nul 2>nul
+if exist "%WORK%\total.txt" set /p DBCOUNT=<"%WORK%\total.txt"
+%SUP%ls -lZ %DBPATH%%SUQ% > "%WORK%\db.ls" 2>nul
+type "%WORK%\db.ls" 2>nul
+
+echo [6/6] 清理临时文件...
+%SUP%rm -rf /data/local/tmp/v4a_work /data/local/tmp/v4a_ddc; rm -f /data/local/tmp/v4a_new.db%SUQ% >nul 2>nul
 rmdir /s /q "%WORK%" 2>nul
+if defined ROOTED (
+    echo [*] 还原 adbd 为非 root 模式...
+    %ADB% unroot >nul 2>nul
+    ping -n 3 127.0.0.1 >nul
+    %ADB% wait-for-device >nul 2>nul
+)
 
 echo.
 echo ============================================
@@ -135,7 +176,12 @@ exit /b 0
 
 :fail_clean
 rmdir /s /q "%WORK%" 2>nul
-%SH% "rm -rf /data/local/tmp/v4a_work" >nul 2>nul
+%SUP%rm -rf /data/local/tmp/v4a_work /data/local/tmp/v4a_ddc; rm -f /data/local/tmp/v4a_new.db%SUQ% >nul 2>nul
+if defined ROOTED (
+    %ADB% unroot >nul 2>nul
+    ping -n 3 127.0.0.1 >nul
+    %ADB% wait-for-device >nul 2>nul
+)
 :fail
 echo.
 echo 导入失败。
@@ -201,5 +247,7 @@ con.commit()
 total = con.execute("SELECT COUNT(*) FROM presets").fetchone()[0]
 con.close()
 out("  新增 %d 个，更新 %d 个，跳过 %d 个，当前共 %d 个" % (added, updated, skipped, total))
+with open(os.path.join(os.path.dirname(db), "total.txt"), "w") as f:
+    f.write(str(total))
 
 sys.exit(4 if (added + updated) == 0 else 0)
